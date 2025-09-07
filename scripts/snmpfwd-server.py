@@ -17,6 +17,12 @@ from pysnmp.entity import engine, config
 from pysnmp.entity.rfc3413 import cmdrsp, ntfrcv, context
 from pysnmp.proto.proxy import rfc2576
 from pysnmp.carrier.asynsock.dgram import udp
+from pyasn1.codec.ber import decoder
+from pysnmp.proto.api import v2c as v2c_api
+
+gKnownCommunities = set()   # cache of (version, community)
+
+
 try:
     from pysnmp.carrier.asynsock.dgram import udp6
 except ImportError:
@@ -459,6 +465,44 @@ def main():
 
         cbCtx.clear()
         cbCtx.update(trunkReq)
+    def autoMapCommunityObserver(snmpEngine, execpoint, variables, cbCtx):
+        wholeMsg = variables.get('wholeMsg')
+        if not wholeMsg:
+            return
+
+        try:
+            # Decode SNMPv1/v2c message header
+            msg, rest = decoder.decode(wholeMsg, asn1Spec=v2c_api.Message())
+            ver = int(msg.getComponentByPosition(0))  # 0=v1, 1=v2c, 3=v3
+            if ver not in (0, 1):
+                return
+
+            comm_octets = msg.getComponentByPosition(1).asOctets()
+            community = comm_octets.decode('latin-1', errors='ignore')
+            key = (ver, community)
+
+            if key in gKnownCommunities:
+                return
+
+            # Decide which securityName to use (configured in server.conf)
+            if ver == 0:
+                secName = cbCtx.get('auto_secname_v1', 'wildcard-v1')
+            else:
+                secName = cbCtx.get('auto_secname_v2c', 'wildcard-v2c')
+
+            # Add mapping so pysnmp knows this community
+            try:
+                config.addV1System(snmpEngine, secName, community, securityName=secName)
+            except Exception:
+                # Ignore if already exists
+                pass
+
+            gKnownCommunities.add(key)
+            log.info('Auto-mapped community "%s" to secName "%s" (v%s)' % (community, secName, ver + 1))
+
+        except Exception as e:
+            log.debug('autoMapCommunityObserver failed: %s' % e)
+
 
     #
     # main script starts here
@@ -657,6 +701,11 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
                 'rfc3412.receiveMessage:request',
                 cbCtx=gCurrentRequestContext
             )
+            snmpEngine.observer.registerObserver(
+                autoMapCommunityObserver,
+                'rfc3412.receiveMessage:request',
+                cbCtx=gCurrentRequestContext
+            )
 
             snmpEngine.observer.registerObserver(
                 usmRequestObserver,
@@ -732,7 +781,7 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
 
         if securityModel in (1, 2):
             if securityName in snmpEngineMap['securityName']:
-                if snmpEngineMap['securityName'][securityModel] == securityModel:
+                if snmpEngineMap['securityName'][securityName] == securityModel:
                     log.info('using security-name %s' % securityName)
                 else:
                     raise SnmpfwdError('snmp-security-name %s already in use at snmp-security-model %s' % (securityName, securityModel))
@@ -741,6 +790,10 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
                 config.addV1System(snmpEngine, securityName, communityName,
                                    securityName=securityName)
                 log.info('new community-name %s, security-model %s, security-name %s, security-level %s' % (communityName, securityModel, securityName, securityLevel))
+                if int(securityModel) == 1:
+                    gCurrentRequestContext['auto_secname_v1'] = securityName
+                elif int(securityModel) == 2:
+                    gCurrentRequestContext['auto_secname_v2c'] = securityName
                 snmpEngineMap['securityName'][securityName] = securityModel
 
             configKey.append(securityModel)
