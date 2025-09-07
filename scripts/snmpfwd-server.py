@@ -732,7 +732,7 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
 
         if securityModel in (1, 2):
             if securityName in snmpEngineMap['securityName']:
-                if snmpEngineMap['securityName'][securityModel] == securityModel:
+                if snmpEngineMap['securityName'][securityName] == securityModel:
                     log.info('using security-name %s' % securityName)
                 else:
                     raise SnmpfwdError('snmp-security-name %s already in use at snmp-security-model %s' % (securityName, securityModel))
