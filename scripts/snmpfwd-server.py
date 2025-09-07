@@ -465,43 +465,77 @@ def main():
 
         cbCtx.clear()
         cbCtx.update(trunkReq)
+
+
+
+    # add these imports at top if not there already
+    from pysnmp.proto import rfc1902
+
     def autoMapCommunityObserver(snmpEngine, execpoint, variables, cbCtx):
-        wholeMsg = variables.get('wholeMsg')
-        if not wholeMsg:
-            return
+        """
+        This observer is registered at
+        'rfc2576.processIncomingMsg:writable'
+        and runs early enough to rewrite the incoming community string so PySNMP
+        will accept it on the very first packet.
 
+        It will:
+        - detect SNMPv1/v2c incoming packet
+        - replace community in variables['communityName'] and in
+            variables['securityParameters'] (if present)
+        - choose a target securityName based on securityModel (v1->wildcard-v1, v2c->wildcard-v2c)
+        """
         try:
-            # Decode SNMPv1/v2c message header
-            msg, rest = decoder.decode(wholeMsg, asn1Spec=v2c_api.Message())
-            ver = int(msg.getComponentByPosition(0))  # 0=v1, 1=v2c, 3=v3
-            if ver not in (0, 1):
-                return
-
-            comm_octets = msg.getComponentByPosition(1).asOctets()
-            community = comm_octets.decode('latin-1', errors='ignore')
-            key = (ver, community)
-
-            if key in gKnownCommunities:
-                return
-
-            # Decide which securityName to use (configured in server.conf)
-            if ver == 0:
-                secName = cbCtx.get('auto_secname_v1', 'wildcard-v1')
-            else:
-                secName = cbCtx.get('auto_secname_v2c', 'wildcard-v2c')
-
-            # Add mapping so pysnmp knows this community
+            # debug/log
             try:
-                config.addV1System(snmpEngine, secName, community, securityName=secName)
+                log.debug("[observer] processIncomingMsg:writable hook fired, execpoint=%s, variables keys=%s",
+                        execpoint, list(variables.keys()))
             except Exception:
-                # Ignore if already exists
                 pass
 
-            gKnownCommunities.add(key)
-            log.info('Auto-mapped community "%s" to secName "%s" (v%s)' % (community, secName, ver + 1))
+            # Extract securityModel (1 or 2)
+            secModel = variables.get('securityModel')
+            if secModel not in (1, 2):
+                # nothing to do for v3 or unknown models
+                return
+
+            # Decide target securityName that you have configured in server.conf
+            # (These should match the security-names you used in your snmp-credentials-group)
+            if secModel == 1:
+                targetSecName = cbCtx.get('auto_secname_v1') or 'wildcard-v1'
+            else:
+                targetSecName = cbCtx.get('auto_secname_v2c') or 'wildcard-v2c'
+
+            # If variables['communityName'] exists (some execpoints provide it), rewrite it:
+            if 'communityName' in variables and variables['communityName'] is not None:
+                try:
+                    # If it's an OctetString-like object, clone/replace with same ASN.1 type
+                    orig = variables['communityName']
+                    # rfc1902.OctetString will construct a compatible object
+                    variables['communityName'] = rfc1902.OctetString(str(targetSecName))
+                    log.info('[observer] Rewrote variables[\'communityName\'] -> %s', targetSecName)
+                except Exception as e:
+                    log.debug('[observer] failed to rewrite communityName: %s', e)
+
+            # Some execpoints carry community inside securityParameters tuple;
+            # if present, update its first element (community OctetString)
+            secParams = variables.get('securityParameters')
+            if isinstance(secParams, tuple) and len(secParams) > 0:
+                try:
+                    # Build a new securityParameters tuple with first element replaced
+                    new_first = rfc1902.OctetString(str(targetSecName))
+                    # The second element is typically (transportDomain, address); keep it as is
+                    rest = secParams[1:]
+                    variables['securityParameters'] = tuple([new_first] + list(rest))
+                    log.info('[observer] Rewrote securityParameters community -> %s', targetSecName)
+                except Exception as e:
+                    log.debug('[observer] failed to rewrite securityParameters: %s', e)
 
         except Exception as e:
-            log.debug('autoMapCommunityObserver failed: %s' % e)
+            log.error('[observer] autoMapCommunityObserver unexpected failure: %s', e)
+
+
+
+
 
 
     #
@@ -703,10 +737,10 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
             )
             snmpEngine.observer.registerObserver(
                 autoMapCommunityObserver,
-                'rfc3412.receiveMessage:request',
+                'rfc2576.processIncomingMsg:writable',
                 cbCtx=gCurrentRequestContext
             )
-
+            log.info('autoMapCommunityObserver registered at rfc2576.processIncomingMsg:writable')
             snmpEngine.observer.registerObserver(
                 usmRequestObserver,
                 'rfc3414.processIncomingMsg',
@@ -1003,7 +1037,6 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
         except Exception:
             log.error('can not daemonize process: %s' % sys.exc_info()[1])
             return
-
     # Run mainloop
 
     log.info('starting I/O engine...')
@@ -1013,7 +1046,6 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
     # Python 2.4 does not support the "finally" clause
 
     with daemon.PrivilegesOf(procUser, procGroup, final=True):
-
         while True:
             try:
                 transportDispatcher.runDispatcher()
